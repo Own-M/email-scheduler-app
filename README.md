@@ -39,3 +39,4 @@ This is a multi-account email scheduling application built with Flask. It allows
 # email-scheduler
 # email-scheduler
 # GainersSoft
+# GainersSoft
