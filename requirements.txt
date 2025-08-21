@@ -1,0 +1,6 @@
+flask
+sqlalchemy
+pandas
+openpyxl
+email-validator
+python-dotenv

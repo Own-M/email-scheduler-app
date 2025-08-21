@@ -1,0 +1,11 @@
+# SQLite Database
+data/email_scheduler.sqlite
+
+# Python virtual environment
+venv/
+*.pyc
+__pycache__/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
