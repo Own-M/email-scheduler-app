@@ -34,3 +34,4 @@ This is a multi-account email scheduling application built with Flask. It allows
 # email-scheduler-app
 # email-scheduler-app-
 # email-scheduler-app
+# email-scheduler-app
