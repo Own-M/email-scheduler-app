@@ -4,3 +4,5 @@ pandas
 openpyxl
 email-validator
 python-dotenv
+requests
+urllib3
