@@ -8,6 +8,7 @@ import time
 import heapq
 import threading
 import uuid
+import secrets
 import imaplib
 import email
 import ssl
@@ -25,7 +26,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from flask import Flask, request, redirect, url_for, flash, render_template_string, jsonify
+from flask import Flask, request, redirect, url_for, flash, render_template_string, jsonify, abort
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, func, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, joinedload
 from werkzeug.utils import secure_filename
@@ -54,7 +55,7 @@ class User(Base, UserMixin):
     id = Column(Integer, primary_key=True)
     username = Column(String(150), unique=True, nullable=False)
     password_hash = Column(String(256), nullable=False)
-    gemini_api_key = Column(String(256), nullable=True, default="AIzaSyAdK1X_ImqFwnURtekBVOjs6FODvD7t8ps")
+    gemini_api_key = Column(String(256), nullable=True)
     accounts = relationship("Account", back_populates="user", cascade="all, delete-orphan")
     contacts = relationship("Contact", back_populates="user", cascade="all, delete-orphan")
     templates = relationship("Template", back_populates="user", cascade="all, delete-orphan")
@@ -116,8 +117,25 @@ class Contact(Base):
     email = Column(String(320), nullable=False)
     user = relationship("User", back_populates="contacts")
 
+class Unsubscribe(Base):
+    __tablename__ = "unsubscribes"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    email = Column(String(320), nullable=False)
+    token = Column(String(64), nullable=False, unique=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_unsubscribed = Column(Boolean, default=False, nullable=False)
+
 Account.tasks = relationship("Task", order_by=Task.id, back_populates="account", cascade="all, delete-orphan")
 Base.metadata.create_all(engine)
+
+def _run_schema_migrations():
+    with engine.begin() as conn:
+        columns = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info(unsubscribes)").fetchall()]
+        if columns and 'is_unsubscribed' not in columns:
+            conn.exec_driver_sql("ALTER TABLE unsubscribes ADD COLUMN is_unsubscribed BOOLEAN NOT NULL DEFAULT 0")
+
+_run_schema_migrations()
 
 # --- Flask App and Login Manager Initialization ---
 app = Flask(__name__)
@@ -140,12 +158,44 @@ STOP_EVENT = threading.Event()
 WORKER_STARTED = threading.Event()
 IMAP_STARTED = threading.Event()
 
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:5000")
+
 # --- Helper Functions ---
 def _create_unverified_ssl_context():
     context = ssl.create_default_context()
     context.check_hostname = False
     context.verify_mode = ssl.CERT_NONE
     return context
+
+def _normalize_email(value):
+    return (value or "").strip().lower()
+
+def _is_unsubscribed(session, user_id, recipient_email):
+    return session.query(Unsubscribe).filter_by(user_id=user_id, email=_normalize_email(recipient_email), is_unsubscribed=True).first() is not None
+
+def _get_or_create_unsubscribe_token(session, user_id, recipient_email):
+    normalized = _normalize_email(recipient_email)
+    existing = session.query(Unsubscribe).filter_by(user_id=user_id, email=normalized).first()
+    if existing:
+        return existing.token
+
+    token = secrets.token_urlsafe(24)
+    entry = Unsubscribe(user_id=user_id, email=normalized, token=token)
+    session.add(entry)
+    session.flush()
+    return token
+
+def _inject_unsubscribe_footer(session, account_id, recipient_email, html_body):
+    account = session.get(Account, int(account_id))
+    token = _get_or_create_unsubscribe_token(session, account.user_id, recipient_email)
+    unsubscribe_link = f"{APP_BASE_URL.rstrip('/')}{url_for('unsubscribe', token=token)}"
+    footer = (
+        "<hr><p style='font-size:12px;color:#6c757d;'>"
+        f"You are receiving this email from {account.name}. "
+        f"<a href='{unsubscribe_link}'>Unsubscribe</a>"
+        "</p>"
+    )
+    return f"{html_body}\n{footer}"
 
 def _push_task_heap(send_at, task_id):
     with HEAP_LOCK:
@@ -315,6 +365,7 @@ def render_page(content_template, **kwargs):
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'accounts' %}active{% endif %}" href="{{ url_for('accounts') }}">Accounts</a></li>
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'inbox' %}active{% endif %}" href="{{ url_for('inbox') }}">Inbox</a></li>
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'contacts' %}active{% endif %}" href="{{ url_for('contacts') }}">Contacts</a></li>
+                        <li class="nav-item"><a class="nav-link {% if request.endpoint == 'unsubscribes' %}active{% endif %}" href="{{ url_for('unsubscribes') }}">Unsubscribes</a></li>
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'templates' %}active{% endif %}" href="{{ url_for('templates') }}">Templates</a></li>
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'bulk_upload' %}active{% endif %}" href="{{ url_for('bulk_upload') }}">Bulk Upload</a></li>
                         <li class="nav-item"><a class="nav-link {% if request.endpoint == 'analytics' %}active{% endif %}" href="{{ url_for('analytics') }}">Analytics</a></li>
@@ -738,6 +789,33 @@ CONTACTS_PAGE = """
 </div>
 """
 
+UNSUBSCRIBES_PAGE = """
+<div class="card">
+    <div class="card-header bg-light d-flex justify-content-between align-items-center">
+        <h5><i class="bi bi-shield-x"></i> Suppression List</h5>
+        <span class="badge text-bg-secondary">{{ unsubscribes|length }} unsubscribed</span>
+    </div>
+    <div class="card-body">
+        <p class="text-muted">These contacts opted out and are automatically excluded from compose and bulk sends.</p>
+        <ul class="list-group">
+            {% for item in unsubscribes %}
+            <li class="list-group-item d-flex justify-content-between align-items-center">
+                <div>
+                    <strong>{{ item.email }}</strong>
+                    <small class="text-muted d-block">{{ item.created_at.strftime('%Y-%m-%d %H:%M') }}</small>
+                </div>
+                <form method="POST" action="{{ url_for('resubscribe', unsubscribe_id=item.id) }}">
+                    <button type="submit" class="btn btn-sm btn-outline-success"><i class="bi bi-arrow-repeat"></i> Allow Again</button>
+                </form>
+            </li>
+            {% else %}
+            <li class="list-group-item text-center text-muted">No unsubscribe records yet.</li>
+            {% endfor %}
+        </ul>
+    </div>
+</div>
+"""
+
 BULK_UPLOAD_PAGE = """
 <div class="card">
     <div class="card-header bg-light"><h5><i class="bi bi-upload"></i> Bulk Schedule Emails</h5></div>
@@ -862,34 +940,56 @@ def compose():
         broadcast = request.args.get('broadcast', type=bool)
         
         if request.method == "POST":
-            account_id = request.form["account_id"]
-            subject = request.form["subject"]
-            body = request.form["body"]
+            account_id = int(request.form["account_id"])
+            account = session.query(Account).filter_by(id=account_id, user_id=current_user.id).first()
+            if not account:
+                flash("Invalid sender account selected.", "danger")
+                return redirect(url_for("compose"))
+
+            subject = request.form["subject"].strip()
+            body = request.form["body"].strip()
             send_at_dt = datetime.strptime(request.form["send_at"], "%Y-%m-%dT%H:%M")
             attachment_path = None
-            
+
+            if not subject or not body:
+                flash("Subject and body are required.", "warning")
+                return redirect(url_for("compose", broadcast=broadcast))
+
             if 'attachment' in request.files:
                 file = request.files['attachment']
                 if file.filename != '':
-                    filename = secure_filename(file.filename)
+                    filename = f"{uuid.uuid4().hex}_{secure_filename(file.filename)}"
                     attachment_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                     file.save(attachment_path)
 
+            scheduled_count = 0
+            skipped_count = 0
             if broadcast:
                 all_contacts = session.query(Contact).filter_by(user_id=current_user.id).all()
                 for contact in all_contacts:
-                    task = Task(account_id=account_id, receiver=contact.email, subject=subject, body=body, send_at=send_at_dt, attachment_path=attachment_path)
+                    recipient = _normalize_email(contact.email)
+                    if _is_unsubscribed(session, current_user.id, recipient):
+                        skipped_count += 1
+                        continue
+                    final_body = _inject_unsubscribe_footer(session, account.id, recipient, body)
+                    task = Task(account_id=account.id, receiver=recipient, subject=subject, body=final_body, send_at=send_at_dt, attachment_path=attachment_path)
                     session.add(task)
                     session.flush()
                     _push_task_heap(send_at_dt, task.id)
-                flash(f"Broadcast scheduled for {len(all_contacts)} contacts!", "success")
+                    scheduled_count += 1
+                flash(f"Broadcast scheduled for {scheduled_count} contacts. Skipped {skipped_count} unsubscribed recipients.", "success")
             else:
-                task = Task(account_id=account_id, receiver=request.form["receiver"], subject=subject, body=body, send_at=send_at_dt, attachment_path=attachment_path)
+                recipient = _normalize_email(request.form["receiver"])
+                if _is_unsubscribed(session, current_user.id, recipient):
+                    flash("This recipient has unsubscribed and cannot be emailed.", "danger")
+                    return redirect(url_for("compose"))
+                final_body = _inject_unsubscribe_footer(session, account.id, recipient, body)
+                task = Task(account_id=account.id, receiver=recipient, subject=subject, body=final_body, send_at=send_at_dt, attachment_path=attachment_path)
                 session.add(task)
                 session.flush()
                 _push_task_heap(send_at_dt, task.id)
                 flash("Email scheduled successfully!", "success")
-            
+
             session.commit()
             return redirect(url_for("dashboard"))
 
@@ -908,7 +1008,17 @@ def inbox():
 def contacts():
     with SessionLocal() as session:
         if request.method == "POST":
-            contact = Contact(name=request.form["name"], email=request.form["email"], user_id=current_user.id)
+            email_value = _normalize_email(request.form["email"])
+            if _is_unsubscribed(session, current_user.id, email_value):
+                flash("This email is in the suppression list and cannot be re-added as a target contact.", "warning")
+                return redirect(url_for("contacts"))
+
+            existing = session.query(Contact).filter_by(user_id=current_user.id, email=email_value).first()
+            if existing:
+                flash("Contact already exists.", "warning")
+                return redirect(url_for("contacts"))
+
+            contact = Contact(name=request.form["name"].strip(), email=email_value, user_id=current_user.id)
             session.add(contact)
             session.commit()
             flash("Contact added.", "success")
@@ -994,23 +1104,74 @@ def bulk_upload():
                     flash("Unsupported file type.", "danger")
                     return redirect(url_for("bulk_upload"))
 
-                account_id = request.form["account_id"]
-                count = 0
+                account_id = int(request.form["account_id"])
+                account = session.query(Account).filter_by(id=account_id, user_id=current_user.id).first()
+                if not account:
+                    flash("Invalid sender account selected.", "danger")
+                    return redirect(url_for("bulk_upload"))
+
+                scheduled_count = 0
+                skipped_count = 0
                 for _, row in df.iterrows():
+                    recipient = _normalize_email(row['Receiver'])
+                    if _is_unsubscribed(session, current_user.id, recipient):
+                        skipped_count += 1
+                        continue
+
                     send_at_dt = pd.to_datetime(row['Schedule']).to_pydatetime()
-                    task = Task(account_id=account_id, receiver=row['Receiver'], subject=row['Subject'], body=row['Body'], send_at=send_at_dt)
+                    final_body = _inject_unsubscribe_footer(session, account.id, recipient, str(row['Body']))
+                    task = Task(account_id=account.id, receiver=recipient, subject=str(row['Subject']), body=final_body, send_at=send_at_dt)
                     session.add(task)
                     session.flush()
                     _push_task_heap(send_at_dt, task.id)
-                    count += 1
+                    scheduled_count += 1
                 session.commit()
-                flash(f"Successfully scheduled {count} emails from file.", "success")
+                flash(f"Successfully scheduled {scheduled_count} emails from file. Skipped {skipped_count} unsubscribed recipients.", "success")
                 return redirect(url_for("dashboard"))
             except Exception as e:
                 flash(f"Error processing file: {e}", "danger")
                 return redirect(url_for("bulk_upload"))
 
         return render_page(BULK_UPLOAD_PAGE, accounts=accounts)
+
+@app.route("/unsubscribes")
+@login_required
+def unsubscribes():
+    with SessionLocal() as session:
+        records = session.query(Unsubscribe).filter_by(user_id=current_user.id, is_unsubscribed=True).order_by(Unsubscribe.created_at.desc()).all()
+        return render_page(UNSUBSCRIBES_PAGE, unsubscribes=records)
+
+@app.route("/resubscribe/<int:unsubscribe_id>", methods=["POST"])
+@login_required
+def resubscribe(unsubscribe_id):
+    with SessionLocal() as session:
+        record = session.query(Unsubscribe).filter_by(id=unsubscribe_id, user_id=current_user.id).first()
+        if record:
+            record.is_unsubscribed = False
+            session.commit()
+            flash("Recipient removed from suppression list.", "success")
+    return redirect(url_for("unsubscribes"))
+
+@app.route('/unsubscribe/<token>')
+def unsubscribe(token):
+    with SessionLocal() as session:
+        record = session.query(Unsubscribe).filter_by(token=token).first()
+        if not record:
+            abort(404)
+        record.is_unsubscribed = True
+        session.commit()
+        return render_template_string("""
+        <!doctype html><html><head><meta charset='utf-8'><title>Unsubscribed</title>
+        <link href='https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css' rel='stylesheet'></head>
+        <body class='bg-light'><div class='container py-5'><div class='card mx-auto' style='max-width:520px'>
+        <div class='card-body text-center p-4'><h3 class='mb-3'>You've been unsubscribed</h3>
+        <p class='text-muted mb-0'>{{ email }} has been removed from future campaigns for this workspace.</p></div>
+        </div></div></body></html>
+        """, email=record.email)
+
+@app.route('/healthz')
+def healthz():
+    return jsonify({'status': 'ok', 'time': datetime.utcnow().isoformat() + 'Z'})
 
 # --- Auth Routes ---
 @app.route('/login', methods=['GET', 'POST'])
@@ -1033,8 +1194,13 @@ def register():
         return redirect(url_for('dashboard'))
     if request.method == 'POST':
         with SessionLocal() as session:
+            username = request.form['username'].strip()
+            if session.query(User).filter_by(username=username).first():
+                flash('Username already exists. Please choose another one.', 'danger')
+                return redirect(url_for('register'))
+
             hashed_password = generate_password_hash(request.form['password'], method='pbkdf2:sha256')
-            new_user = User(username=request.form['username'], password_hash=hashed_password)
+            new_user = User(username=username, password_hash=hashed_password)
             session.add(new_user)
             session.commit()
             flash('Registration successful! Please login.', 'success')
